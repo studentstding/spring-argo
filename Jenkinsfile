@@ -51,7 +51,6 @@ spec:
     options {
         // Dwa buildy tej samej gałęzi naraz kłóciłyby się przy pushu manifestu (kolejne czekają w kolejce)
         disableConcurrentBuilds()
-        timestamps()
     }
 
     parameters {
