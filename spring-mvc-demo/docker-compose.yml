@@ -1,0 +1,42 @@
+# Aplikacja (profil prod) + MySQL. Start: docker compose up --build
+services:
+  db:
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: appdb
+      MYSQL_USER: app
+      MYSQL_PASSWORD: ${DB_PASSWORD:-tajne}
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-rootpass}
+    command: ["--character-set-server=utf8mb4", "--collation-server=utf8mb4_0900_ai_ci"]
+    volumes:
+      - mysqldata:/var/lib/mysql
+      # Skrypty z tego katalogu MySQL wykonuje tylko przy pierwszym starcie (pusty wolumen)
+      - ./src/main/resources/db/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./src/main/resources/db/data.sql:/docker-entrypoint-initdb.d/02-data.sql:ro
+    ports:
+      - "3306:3306"
+    healthcheck:
+      # -h 127.0.0.1 wymusza TCP. W trakcie inicjalizacji MySQL działa tymczasowo
+      # bez sieci (tylko socket), więc "localhost" dałby fałszywe "gotowe".
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u app -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    image: spring-mvc-demo:1.0.0
+    depends_on:
+      db:
+        condition: service_healthy   # czekamy, aż baza przyjmuje połączenia po TCP
+    environment:
+      # Spring mapuje SPRING_PROFILES_ACTIVE na spring.profiles.active
+      SPRING_PROFILES_ACTIVE: prod
+      DB_URL: jdbc:mysql://db:3306/appdb   # "db" = nazwa serwisu w tej sieci
+      DB_USER: app
+      DB_PASSWORD: ${DB_PASSWORD:-tajne}
+    ports:
+      - "8080:8080"
+
+volumes:
+  mysqldata:

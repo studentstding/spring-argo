@@ -1,0 +1,48 @@
+# Aplikacja za F5 NGINX Ingress Controller
+# Ruch: Load Balancer (L4, Service kontrolera) -> pody NGINX -> Service app -> pody app
+#
+# Wymaga zainstalowanego kontrolera (IngressClass "nginx"):
+#   helm install nginx-ingress oci://ghcr.io/nginx/charts/nginx-ingress \
+#     --version 2.7.3 --namespace nginx-ingress --create-namespace
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: app-legacy
+  namespace: app
+spec:
+  type: ClusterIP              # aplikacja nie dostaje własnego LB; wystawia ją NGINX
+  selector:
+    app: app-legacy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http         # nazwany port 8080 z Deploymentu
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: app-nginx
+  namespace: app
+  annotations:
+    nginx.org/rewrites: "serviceName=app-legacy rewrite=/"
+spec:
+  ingressClassName: nginx      # obsługuje go kontroler NGINX, nie GCE
+  rules:
+    - host: app.34.116.216.115.nip.io
+      http:                    # bez "host:" = każde żądanie na IP kontrolera trafia tutaj
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: app
+                port:
+                  number: 80
+          - path: /legacy/
+            pathType: Prefix
+            backend:
+              service:
+                name: app-legacy
+                port:
+                  number: 80

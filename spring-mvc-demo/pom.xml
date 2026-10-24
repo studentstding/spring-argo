@@ -1,0 +1,133 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <groupId>pl.app</groupId>
+    <artifactId>spring-mvc-demo</artifactId>
+    <version>1.0.0</version>
+    <!-- Czysty Spring: budujemy WAR i wrzucamy na zewnętrzny serwer -->
+    <packaging>war</packaging>
+
+    <properties>
+        <maven.compiler.release>17</maven.compiler.release>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <lombok.version>1.18.48</lombok.version>
+    </properties>
+
+    <!-- BOM pilnuje, żeby wszystkie moduły Springa miały tę samą wersję -->
+    <dependencyManagement>
+        <dependencies>
+            <dependency>
+                <groupId>org.springframework</groupId>
+                <artifactId>spring-framework-bom</artifactId>
+                <version>7.0.8</version>
+                <type>pom</type>
+                <scope>import</scope>
+            </dependency>
+        </dependencies>
+    </dependencyManagement>
+
+    <dependencies>
+        <!-- Spring MVC (ciągnie za sobą spring-context, spring-web, spring-beans) -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-webmvc</artifactId>
+        </dependency>
+
+        <!-- JSON w odpowiedziach @RestController (Spring 7 używa Jackson 3) -->
+        <dependency>
+            <groupId>tools.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>3.0.0</version>
+        </dependency>
+
+        <!-- ===== Baza danych ===== -->
+
+        <!-- Integracja Springa z JPA: EntityManagerFactory, JpaTransactionManager.
+             Ciągnie za sobą spring-jdbc i spring-tx. -->
+        <dependency>
+            <groupId>org.springframework</groupId>
+            <artifactId>spring-orm</artifactId>
+        </dependency>
+
+        <!-- Implementacja JPA (przynosi też jakarta.persistence-api) -->
+        <dependency>
+            <groupId>org.hibernate.orm</groupId>
+            <artifactId>hibernate-core</artifactId>
+            <version>7.4.13.Final</version>
+        </dependency>
+
+        <!-- Pula połączeń (w Boocie domyślna, tu dodajemy ją sami) -->
+        <dependency>
+            <groupId>com.zaxxer</groupId>
+            <artifactId>HikariCP</artifactId>
+            <version>6.3.0</version>
+        </dependency>
+
+        <!-- Profil dev: baza H2 w pamięci, nic nie trzeba instalować -->
+        <dependency>
+            <groupId>com.h2database</groupId>
+            <artifactId>h2</artifactId>
+            <version>2.3.232</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Profil prod: MySQL -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+            <version>9.7.0</version>
+            <scope>runtime</scope>
+        </dependency>
+
+        <!-- Lombok: generuje gettery, settery i konstruktory w czasie kompilacji.
+             provided = potrzebny tylko przy kompilacji, nie trafia do WAR-a -->
+        <dependency>
+            <groupId>org.projectlombok</groupId>
+            <artifactId>lombok</artifactId>
+            <version>${lombok.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- API serwletów dostarcza serwer (Tomcat 11), więc scope provided -->
+        <dependency>
+            <groupId>jakarta.servlet</groupId>
+            <artifactId>jakarta.servlet-api</artifactId>
+            <version>6.1.0</version>
+            <scope>provided</scope>
+        </dependency>
+    </dependencies>
+
+    <build>
+        <finalName>spring-mvc-demo</finalName>
+        <plugins>
+            <!-- Lombok działa jako procesor adnotacji. Nowsze JDK (23+) nie uruchamiają
+                 procesorów z classpath automatycznie, więc wskazujemy go jawnie. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <version>3.14.0</version>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                            <version>${lombok.version}</version>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-war-plugin</artifactId>
+                <version>3.4.0</version>
+                <configuration>
+                    <!-- Nie mamy web.xml, konfiguracja jest w Javie -->
+                    <failOnMissingWebXml>false</failOnMissingWebXml>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>

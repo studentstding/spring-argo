@@ -1,0 +1,91 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: app
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: app-ksa
+  namespace: app
+  annotations:
+    iam.gke.io/gcp-service-account: sa-database@mr-dev12.iam.gserviceaccount.com
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: app-legacy
+  namespace: app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: app-legacy
+  template:
+    metadata:
+      labels:
+        app: app-legacy
+    spec:
+      serviceAccountName: app-ksa
+      initContainers:
+        - name: cloud-sql-proxy
+          image: gcr.io/cloud-sql-connectors/cloud-sql-proxy:2.26.0
+          restartPolicy: Always
+          args:
+            - "--auto-iam-authn"
+            - "--port=3306"
+            - "--structured-logs"
+            - "--health-check"
+            - "--http-address=0.0.0.0"
+            - "mr-dev12:europe-central2:mysql"
+          startupProbe:
+            httpGet:
+              path: /startup
+              port: 9090
+            periodSeconds: 1
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /liveness
+              port: 9090
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 256Mi
+      containers:
+        - name: app-legacy
+          image: europe-central2-docker.pkg.dev/mr-dev12/apps/app-legacy:latest
+          env:
+            - name: SPRING_PROFILES_ACTIVE
+              value: "prod"
+          ports:
+            - name: http
+              containerPort: 8080
+#          readinessProbe:
+#            httpGet:
+#              path: /persons
+#              port: http
+#          livenessProbe:
+#            httpGet:
+#              path: /persons
+#              port: http
+#            initialDelaySeconds: 30
+          resources:
+            requests:
+              cpu: 250m
+              memory: 512Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - mountPath: "/etc/app-secrets"
+              name: app-secrets
+              readOnly: true
+      volumes:
+        - name: app-secrets
+          csi:
+            driver: secrets-store-gke.csi.k8s.io
+            readOnly: true
+            volumeAttributes:
+              secretProviderClass: app-secrets
