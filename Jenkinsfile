@@ -84,7 +84,7 @@ spec:
 
         stage('Build') {
             steps {
-                container('maven') {
+                container('maven') { dir('spring-mvc-demo') {
                     sh '''
                         set -eu
 
