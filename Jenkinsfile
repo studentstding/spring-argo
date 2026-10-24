@@ -63,6 +63,8 @@ spec:
     environment {
         IMAGE_NAME = 'europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo'
 
+        APP_DIR = 'spring-mvc-demo'
+
         MANIFEST_PATH = 'k8s/app-deploy.yaml'
         CONTAINER_NAME = 'app-legacy'
 
@@ -84,16 +86,18 @@ spec:
 
         stage('Build') {
             steps {
-                container('maven') { dir('spring-mvc-demo') {
-                    sh '''
-                        set -eu
+                container('maven') {
+                    dir("${env.APP_DIR}") {
+                        sh '''
+                            set -eu
 
-                        echo "Katalog roboczy:"
-                        pwd
+                            echo "Katalog roboczy:"
+                            pwd
 
-                        echo "Budowanie aplikacji:"
-                        mvn clean package
-                    '''
+                            echo "Budowanie aplikacji:"
+                            mvn clean package
+                        '''
+                    }
                 }
             }
         }
@@ -101,32 +105,26 @@ spec:
         stage('Verify JAR') {
             steps {
                 container('maven') {
-                    sh '''
-                        set -eu
+                    dir("${env.APP_DIR}") {
+                        sh '''
+                            set -eu
 
-                        echo "Pliki w katalogu target:"
-                        find target \
-                            -maxdepth 1 \
-                            -type f \
-                            -name "*.jar" \
-                            -print
+                            echo "Pliki w katalogu target:"
+                            find target -maxdepth 1 -type f -name "*.jar" -print
 
-                        JAR_COUNT="$(
-                            find target \
-                                -maxdepth 1 \
-                                -type f \
-                                -name "*.jar" \
-                                ! -name "original-*" \
-                                | wc -l
-                        )"
+                            JAR_COUNT="$(
+                                find target -maxdepth 1 -type f -name "*.jar" ! -name "original-*" \
+                                    | wc -l
+                            )"
 
-                        echo "Liczba właściwych plików JAR: ${JAR_COUNT}"
+                            echo "Liczba właściwych plików JAR: ${JAR_COUNT}"
 
-                        if [ "${JAR_COUNT}" -eq 0 ]; then
-                            echo "BŁĄD: Maven nie utworzył pliku JAR w target/"
-                            exit 1
-                        fi
-                    '''
+                            if [ "${JAR_COUNT}" -eq 0 ]; then
+                                echo "BŁĄD: Maven nie utworzył pliku JAR w target/"
+                                exit 1
+                            fi
+                        '''
+                    }
                 }
             }
         }
@@ -162,20 +160,11 @@ spec:
                             yq '
                                 [
                                     .spec.template.spec.containers[]?
-                                    | select(
-                                        .name == strenv(CONTAINER_NAME)
-                                    )
+                                    | select(.name == strenv(CONTAINER_NAME))
                                 ]
                                 | length
-                            ' "${MANIFEST_PATH}" |
-                            awk '
-                                {
-                                    total += $1
-                                }
-                                END {
-                                    print total + 0
-                                }
-                            '
+                            ' "${MANIFEST_PATH}" \
+                            | awk '{ total += $1 } END { print total + 0 }'
                         )"
 
                         echo "Liczba znalezionych kontenerów: ${MATCHING_CONTAINERS}"
@@ -193,9 +182,7 @@ spec:
                         yq -i '
                             (
                                 .spec.template.spec.containers[]?
-                                | select(
-                                    .name == strenv(CONTAINER_NAME)
-                                )
+                                | select(.name == strenv(CONTAINER_NAME))
                                 | .image
                             ) = strenv(NEW_IMAGE)
                         ' "${MANIFEST_PATH}"
@@ -203,9 +190,7 @@ spec:
                         UPDATED_IMAGE="$(
                             yq -r '
                                 .spec.template.spec.containers[]?
-                                | select(
-                                    .name == strenv(CONTAINER_NAME)
-                                )
+                                | select(.name == strenv(CONTAINER_NAME))
                                 | .image
                             ' "${MANIFEST_PATH}"
                         )"
@@ -239,26 +224,23 @@ spec:
                             set -eu
                             set +x
 
+                            # Kontener git działa jako root, a workspace należy do użytkownika jenkins
+                            git config --global --add safe.directory "${WORKSPACE}"
+
                             mkdir -p "${HOME}/.ssh"
                             chmod 700 "${HOME}/.ssh"
 
-                            ssh-keyscan -H github.com \
-                                > "${HOME}/.ssh/known_hosts"
-
+                            ssh-keyscan -H github.com > "${HOME}/.ssh/known_hosts"
                             chmod 600 "${HOME}/.ssh/known_hosts"
                             chmod 600 "${GIT_SSH_KEY}"
 
-                            export GIT_SSH_COMMAND="ssh \
-                                -i ${GIT_SSH_KEY} \
-                                -o IdentitiesOnly=yes \
-                                -o StrictHostKeyChecking=yes \
-                                -o UserKnownHostsFile=${HOME}/.ssh/known_hosts"
+                            export GIT_SSH_COMMAND="ssh -i ${GIT_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${HOME}/.ssh/known_hosts"
 
                             git config user.name "Jenkins"
                             git config user.email "jenkins@localhost"
 
                             echo "Zmiany w manifeście:"
-                            git diff -- "${MANIFEST_PATH}"
+                            git --no-pager diff -- "${MANIFEST_PATH}"
 
                             if git diff --quiet -- "${MANIFEST_PATH}"; then
                                 echo "Brak zmian w manifeście"
@@ -268,12 +250,12 @@ spec:
 
                             git add "${MANIFEST_PATH}"
 
-                            git commit \
-                                -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${BUILD_NUMBER} [skip ci]"
+                            git commit -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${BUILD_NUMBER} [skip ci]"
 
-                            git push \
-                                "${GIT_SSH_URL}" \
-                                "HEAD:${TARGET_BRANCH}"
+                            # Na wypadek, gdyby ktoś w międzyczasie wypchnął coś na gałąź docelową
+                            git pull --rebase "${GIT_SSH_URL}" "${TARGET_BRANCH}"
+
+                            git push "${GIT_SSH_URL}" "HEAD:${TARGET_BRANCH}"
 
                             echo "Manifest został wysłany do repozytorium"
                             echo "Synchronizację z klastrem wykona Argo CD"
@@ -299,5 +281,4 @@ spec:
             echo "Wybrane środowisko: ${params.ENVIRONMENT}"
         }
     }
-}
 }
