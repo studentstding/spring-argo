@@ -161,10 +161,12 @@ spec:
                             exit 1
                         fi
 
+                        # Tylko dokumenty kind: Deployment - plik zawiera też Namespace, ServiceAccount itd.
                         MATCHING_CONTAINERS="$(
                             yq '
-                                [
-                                    .spec.template.spec.containers[]?
+                                select(.kind == "Deployment")
+                                | [
+                                    .spec.template.spec.containers[]
                                     | select(.name == strenv(CONTAINER_NAME))
                                 ]
                                 | length
@@ -184,22 +186,24 @@ spec:
                             exit 1
                         fi
 
+                        # "with" zmienia tylko istniejące węzły - nie tworzy ścieżek w innych dokumentach
                         yq -i '
-                            (
-                                .spec.template.spec.containers[]?
-                                | select(.name == strenv(CONTAINER_NAME))
-                                | .image
-                            ) = strenv(NEW_IMAGE)
+                            with(
+                                select(.kind == "Deployment")
+                                | .spec.template.spec.containers[]
+                                | select(.name == strenv(CONTAINER_NAME));
+                                .image = strenv(NEW_IMAGE)
+                            )
                         ' "${MANIFEST_PATH}"
 
                         UPDATED_IMAGE="$(
                             yq -r '
-                                .spec.template.spec.containers[]?
+                                select(.kind == "Deployment")
+                                | .spec.template.spec.containers[]
                                 | select(.name == strenv(CONTAINER_NAME))
                                 | .image
                             ' "${MANIFEST_PATH}"
                         )"
-
                         echo "Obraz odczytany po zmianie: ${UPDATED_IMAGE}"
 
                         if [ "${UPDATED_IMAGE}" != "${NEW_IMAGE}" ]; then
