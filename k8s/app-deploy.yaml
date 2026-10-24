@@ -25,7 +25,7 @@ metadata:
   name: app-legacy
   namespace: app
 spec:
-  replicas: 2
+  replicas: 1
   selector:
     matchLabels:
       app: app-legacy
