@@ -15,6 +15,6 @@ public class WhoreController {
  
     @GetMapping("/whore")
     public String findAll() {
-        return "Natalia Czerniszew to kurwa i dziwka z Huciska Kwaśniowskiego najwiekjsza";
+        return "Natalia Czerniszew to kurwa i dziwka z Huciska Kwaśniowskiego najwiekjsza z wszystkich ";
     }
 }
