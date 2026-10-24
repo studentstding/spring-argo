@@ -1,5 +1,13 @@
 @Library('company-library@main') _
 
+/*
+ * Pipeline do joba typu Multibranch Pipeline (GitHub Branch Source):
+ *   - Pull Request -> testy + próbny build obrazu (bez pushu)
+ *   - main         -> testy + build i push obrazu + zmiana tagu w manifeście + commit (Argo CD wdraża)
+ *   - inne gałęzie -> tylko testy
+ * Działa też w zwykłym jobie Pipeline (wtedy gałąź jest brana z GIT_BRANCH).
+ */
+
 pipeline {
 
     agent {
@@ -41,8 +49,9 @@ spec:
     }
 
     options {
-        // Dwa buildy naraz kłóciłyby się przy pushu manifestu
+        // Dwa buildy tej samej gałęzi naraz kłóciłyby się przy pushu manifestu (kolejne czekają w kolejce)
         disableConcurrentBuilds()
+        timestamps()
     }
 
     parameters {
@@ -67,7 +76,7 @@ spec:
 
     environment {
         IMAGE_NAME = 'europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo'
-        IMAGE_TAG  = "${BUILD_NUMBER}"
+        // IMAGE_TAG jest ustawiany w stage'u 'Prepare' jako <BUILD_NUMBER>-<krótki SHA>
 
         // Katalog z pom.xml, src/, lombok.config i Dockerfile (kontekst budowania obrazu)
         APP_DIR = 'spring-mvc-demo'
@@ -79,6 +88,7 @@ spec:
         MANIFEST_PATH  = 'k8s/app-deploy.yaml'
         CONTAINER_NAME = 'app-legacy'
 
+        // Tylko ta gałąź buduje i wdraża obraz
         TARGET_BRANCH = 'main'
 
         GIT_SSH_URL = 'git@github.com:studentstding/spring-argo.git'
@@ -91,14 +101,25 @@ spec:
 
     stages {
 
-        stage('Check Trigger') {
-            // Bezpiecznik przed pętlą: jeśli build wywołał commit Jenkinsa, nic nie robimy
+        stage('Prepare') {
             steps {
                 script {
-                    def author  = sh(script: 'git log -1 --pretty=format:%ae', returnStdout: true).trim()
-                    def message = sh(script: 'git log -1 --pretty=format:%B', returnStdout: true).trim()
+                    def author   = sh(script: 'git log -1 --pretty=format:%ae', returnStdout: true).trim()
+                    def message  = sh(script: 'git log -1 --pretty=format:%B', returnStdout: true).trim()
+                    def shortSha = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
 
-                    if (author == env.GIT_BOT_EMAIL || message.contains('[skip ci]')) {
+                    // CHANGE_ID ustawia Multibranch tylko dla Pull Requestów
+                    env. = env.CHANGE_ID ? 'true' : 'false'
+
+                    // Multibranch ustawia BRANCH_NAME; zwykły job Pipeline tylko GIT_BRANCH (np. origin/main)
+                    def branch = env.BRANCH_NAME ?: (env.GIT_BRANCH ?: '').replaceFirst(/^origin\//, '')
+                    env.IS_MAIN = (env. == 'false' && branch == env.TARGET_BRANCH) ? 'true' : 'false'
+
+                    // Unikalny i czytelny tag: numer builda + commit, z którego powstał obraz
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
+
+                    // Bezpiecznik przed pętlą: commit Jenkinsa na main nie uruchamia ponownie CI/CD
+                    if (env. == 'false' && (author == env.GIT_BOT_EMAIL || message.contains('[skip ci]'))) {
                         env.SKIP_CI = 'true'
                         currentBuild.result = 'NOT_BUILT'
                         currentBuild.description = 'Pominięto: commit od Jenkinsa'
@@ -106,6 +127,14 @@ spec:
                     } else {
                         env.SKIP_CI = 'false'
                     }
+
+                    if (env. == 'true') {
+                        currentBuild.description = "PR #${env.CHANGE_ID} -> ${env.CHANGE_TARGET}"
+                    } else if (env.IS_MAIN == 'true' && env.SKIP_CI != 'true') {
+                        currentBuild.description = "Obraz: ${env.IMAGE_TAG}"
+                    }
+
+                    echo "Gałąź: ${branch ?: '-'} | PR: ${env.} | main: ${env.IS_MAIN} | tag: ${env.IMAGE_TAG}"
                 }
             }
         }
@@ -126,20 +155,53 @@ spec:
                 }
 
                 stage('Test') {
-                    // Dockerfile buduje WAR z -DskipTests, więc testy uruchamiamy tutaj
+                    // Zawsze: PR-y, gałęzie i main. Dockerfile buduje WAR z -DskipTests, więc testy są tutaj.
                     steps {
                         container('maven') {
                             dir("${env.APP_DIR}") {
                                 sh '''
                                     set -eu
-                                    mvn -B test
+                                    mvn -B -ntp test
                                 '''
                             }
+                        }
+                    }
+                    post {
+                        always {
+                            // Wyniki testów widoczne w Jenkinsie i w statusie PR-a
+                            junit(
+                                testResults: "${env.APP_DIR}/target/surefire-reports/*.xml",
+                                allowEmptyResults: true
+                            )
+                        }
+                    }
+                }
+
+                stage('Verify Docker Build') {
+                    // PR: sprawdzamy, czy obraz się buduje, ale nic nie wypychamy
+                    when {
+                        expression { env. == 'true' }
+                    }
+                    steps {
+                        container('kaniko') {
+                            sh '''
+                                set -eu
+
+                                echo "Próbny build obrazu dla PR (bez pushu)"
+
+                                /kaniko/executor \\
+                                    --context="dir://${WORKSPACE}/${APP_DIR}" \\
+                                    --dockerfile="${WORKSPACE}/${APP_DIR}/Dockerfile" \\
+                                    --no-push
+                            '''
                         }
                     }
                 }
 
                 stage('Build & Push Image') {
+                    when {
+                        expression { env.IS_MAIN == 'true' }
+                    }
                     steps {
                         container('kaniko') {
                             withCredentials([
@@ -179,6 +241,9 @@ spec:
                 }
 
                 stage('Update Image in Manifest') {
+                    when {
+                        expression { env.IS_MAIN == 'true' }
+                    }
                     steps {
                         container('yq') {
                             sh '''
@@ -256,6 +321,9 @@ spec:
                 }
 
                 stage('Commit and Push Manifest') {
+                    when {
+                        expression { env.IS_MAIN == 'true' }
+                    }
                     steps {
                         container('git') {
                             withCredentials([
@@ -313,15 +381,17 @@ spec:
         }
     }
 
-  triggers {
-        githubPush()
-    }
-    
     post {
         success {
-            echo 'Pipeline zakończył się poprawnie.'
-            echo "Zbudowany obraz: ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
-            echo "Zmieniony manifest: ${env.MANIFEST_PATH}"
+            script {
+                if (env.IS_MAIN == 'true') {
+                    echo "Wdrożono obraz: ${env.IMAGE_NAME}:${env.IMAGE_TAG} (manifest: ${env.MANIFEST_PATH})"
+                } else if (env. == 'true') {
+                    echo "PR #${env.CHANGE_ID}: testy i próbny build obrazu przeszły."
+                } else {
+                    echo 'Testy przeszły.'
+                }
+            }
         }
 
         notBuilt {
@@ -330,10 +400,6 @@ spec:
 
         failure {
             echo 'Pipeline zakończył się błędem.'
-        }
-
-        always {
-            echo "Wybrane środowisko: ${params.ENVIRONMENT}"
         }
     }
 }
