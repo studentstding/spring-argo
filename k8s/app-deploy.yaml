@@ -2,10 +2,7 @@ apiVersion: v1
 kind: Namespace
 metadata:
   name: app
-spec:
-  template:
-    spec:
-      containers: []
+
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -14,10 +11,7 @@ metadata:
   namespace: app
   annotations:
     iam.gke.io/gcp-service-account: sa-database@mr-dev12.iam.gserviceaccount.com
-spec:
-  template:
-    spec:
-      containers: []
+
 ---
 apiVersion: apps/v1
 kind: Deployment
