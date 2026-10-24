@@ -109,17 +109,17 @@ spec:
                     def shortSha = sh(script: 'git rev-parse --short=7 HEAD', returnStdout: true).trim()
 
                     // CHANGE_ID ustawia Multibranch tylko dla Pull Requestów
-                    env. = env.CHANGE_ID ? 'true' : 'false'
+                    env.IS_PR = env.CHANGE_ID ? 'true' : 'false'
 
                     // Multibranch ustawia BRANCH_NAME; zwykły job Pipeline tylko GIT_BRANCH (np. origin/main)
                     def branch = env.BRANCH_NAME ?: (env.GIT_BRANCH ?: '').replaceFirst(/^origin\//, '')
-                    env.IS_MAIN = (env. == 'false' && branch == env.TARGET_BRANCH) ? 'true' : 'false'
+                    env.IS_MAIN = (env.IS_PR == 'false' && branch == env.TARGET_BRANCH) ? 'true' : 'false'
 
                     // Unikalny i czytelny tag: numer builda + commit, z którego powstał obraz
                     env.IMAGE_TAG = "${env.BUILD_NUMBER}-${shortSha}"
 
                     // Bezpiecznik przed pętlą: commit Jenkinsa na main nie uruchamia ponownie CI/CD
-                    if (env. == 'false' && (author == env.GIT_BOT_EMAIL || message.contains('[skip ci]'))) {
+                    if (env.IS_PR == 'false' && (author == env.GIT_BOT_EMAIL || message.contains('[skip ci]'))) {
                         env.SKIP_CI = 'true'
                         currentBuild.result = 'NOT_BUILT'
                         currentBuild.description = 'Pominięto: commit od Jenkinsa'
@@ -128,13 +128,13 @@ spec:
                         env.SKIP_CI = 'false'
                     }
 
-                    if (env. == 'true') {
+                    if (env.IS_PR == 'true') {
                         currentBuild.description = "PR #${env.CHANGE_ID} -> ${env.CHANGE_TARGET}"
                     } else if (env.IS_MAIN == 'true' && env.SKIP_CI != 'true') {
                         currentBuild.description = "Obraz: ${env.IMAGE_TAG}"
                     }
 
-                    echo "Gałąź: ${branch ?: '-'} | PR: ${env.} | main: ${env.IS_MAIN} | tag: ${env.IMAGE_TAG}"
+                    echo "Gałąź: ${branch ?: '-'} | PR: ${env.IS_PR} | main: ${env.IS_MAIN} | tag: ${env.IMAGE_TAG}"
                 }
             }
         }
@@ -180,7 +180,7 @@ spec:
                 stage('Verify Docker Build') {
                     // PR: sprawdzamy, czy obraz się buduje, ale nic nie wypychamy
                     when {
-                        expression { env. == 'true' }
+                        expression { env.IS_PR == 'true' }
                     }
                     steps {
                         container('kaniko') {
@@ -386,7 +386,7 @@ spec:
             script {
                 if (env.IS_MAIN == 'true') {
                     echo "Wdrożono obraz: ${env.IMAGE_NAME}:${env.IMAGE_TAG} (manifest: ${env.MANIFEST_PATH})"
-                } else if (env. == 'true') {
+                } else if (env.IS_PR == 'true') {
                     echo "PR #${env.CHANGE_ID}: testy i próbny build obrazu przeszły."
                 } else {
                     echo 'Testy przeszły.'
