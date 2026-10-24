@@ -313,6 +313,10 @@ spec:
         }
     }
 
+  triggers {
+        githubPush()
+    }
+    
     post {
         success {
             echo 'Pipeline zakończył się poprawnie.'
