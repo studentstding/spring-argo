@@ -62,10 +62,16 @@ spec:
 
     environment {
         IMAGE_NAME = 'europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo'
+        IMAGE_TAG  = "${BUILD_NUMBER}"
 
+        // Katalog z pom.xml, src/, lombok.config i Dockerfile (kontekst budowania obrazu)
         APP_DIR = 'spring-mvc-demo'
 
-        MANIFEST_PATH = 'k8s/app-deploy.yaml'
+        // Credential typu "Secret file" z kluczem JSON konta serwisowego GCP
+        // (rola: Artifact Registry Writer)
+        GCP_SA_KEY_CREDENTIALS_ID = 'gcp-sa-key'
+
+        MANIFEST_PATH  = 'k8s/app-deploy.yaml'
         CONTAINER_NAME = 'app-legacy'
 
         TARGET_BRANCH = 'main'
@@ -84,57 +90,56 @@ spec:
             }
         }
 
-        stage('Build') {
+        stage('Test') {
+            // Dockerfile buduje WAR z -DskipTests, więc testy uruchamiamy tutaj
             steps {
                 container('maven') {
                     dir("${env.APP_DIR}") {
                         sh '''
                             set -eu
-
-                            echo "Katalog roboczy:"
-                            pwd
-
-                            echo "Budowanie aplikacji:"
-                            mvn clean package
+                            mvn -B test
                         '''
                     }
                 }
             }
         }
 
-        stage('Verify JAR') {
+        stage('Build & Push Image') {
             steps {
-                container('maven') {
-                    dir("${env.APP_DIR}") {
+                container('kaniko') {
+                    withCredentials([
+                        file(
+                            credentialsId: env.GCP_SA_KEY_CREDENTIALS_ID,
+                            variable: 'GCP_SA_KEY'
+                        )
+                    ]) {
                         sh '''
+                            set +x
                             set -eu
 
-                            echo "Pliki w katalogu target:"
-                            find target -maxdepth 1 -type f -name "*.jar" -print
+                            # Host rejestru, np. europe-central2-docker.pkg.dev
+                            REGISTRY="${IMAGE_NAME%%/*}"
 
-                            JAR_COUNT="$(
-                                find target -maxdepth 1 -type f -name "*.jar" ! -name "original-*" \
-                                    | wc -l
-                            )"
+                            # Logowanie do Artifact Registry kluczem JSON (_json_key)
+                            mkdir -p /kaniko/.docker
+                            AUTH="$(printf '%s' "_json_key:$(cat "${GCP_SA_KEY}")" | base64 | tr -d '\\n')"
+                            printf '{"auths":{"%s":{"auth":"%s"}}}' "${REGISTRY}" "${AUTH}" \\
+                                > /kaniko/.docker/config.json
 
-                            echo "Liczba właściwych plików JAR: ${JAR_COUNT}"
+                            echo "Budowanie i push obrazu: ${IMAGE_NAME}:${IMAGE_TAG}"
 
-                            if [ "${JAR_COUNT}" -eq 0 ]; then
-                                echo "BŁĄD: Maven nie utworzył pliku JAR w target/"
-                                exit 1
-                            fi
+                            /kaniko/executor \\
+                                --context="dir://${WORKSPACE}/${APP_DIR}" \\
+                                --dockerfile="${WORKSPACE}/${APP_DIR}/Dockerfile" \\
+                                --destination="${IMAGE_NAME}:${IMAGE_TAG}" \\
+                                --cache=true \\
+                                --cache-repo="${IMAGE_NAME}/cache"
+
+                            rm -f /kaniko/.docker/config.json
+                            echo "Obraz wypchnięty: ${IMAGE_NAME}:${IMAGE_TAG}"
                         '''
                     }
                 }
-            }
-        }
-
-        stage('Build Image') {
-            steps {
-                buildImage(
-                    env.IMAGE_NAME,
-                    env.BUILD_NUMBER
-                )
             }
         }
 
@@ -144,7 +149,7 @@ spec:
                     sh '''
                         set -eu
 
-                        export NEW_IMAGE="${IMAGE_NAME}:${BUILD_NUMBER}"
+                        export NEW_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
                         export CONTAINER_NAME
 
                         echo "Plik manifestu: ${MANIFEST_PATH}"
@@ -221,8 +226,8 @@ spec:
                         )
                     ]) {
                         sh '''
-                            set -eu
                             set +x
+                            set -eu
 
                             # Kontener git działa jako root, a workspace należy do użytkownika jenkins
                             git config --global --add safe.directory "${WORKSPACE}"
@@ -250,7 +255,7 @@ spec:
 
                             git add "${MANIFEST_PATH}"
 
-                            git commit -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${BUILD_NUMBER} [skip ci]"
+                            git commit -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${IMAGE_TAG} [skip ci]"
 
                             # Na wypadek, gdyby ktoś w międzyczasie wypchnął coś na gałąź docelową
                             git pull --rebase "${GIT_SSH_URL}" "${TARGET_BRANCH}"
@@ -269,7 +274,7 @@ spec:
     post {
         success {
             echo 'Pipeline zakończył się poprawnie.'
-            echo "Zbudowany obraz: ${env.IMAGE_NAME}:${env.BUILD_NUMBER}"
+            echo "Zbudowany obraz: ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
             echo "Zmieniony manifest: ${env.MANIFEST_PATH}"
         }
 
