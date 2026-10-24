@@ -121,7 +121,7 @@ spec:
         stage('Build') {
             steps {
                 container('maven') {
-                    dir('demo/demo') {
+                    dir('spring-mvc-demo') {
                         sh '''
                             set -eu
                             mvn clean package
