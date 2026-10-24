@@ -72,7 +72,7 @@ spec:
          *
          * k8s/app-deploy/deployment.yaml
          */
-        MANIFEST_PATH = 'k8s/app-deploy'
+        MANIFEST_PATH = 'k8s/app-deploy.yaml'
 
         CONTAINER_NAME = 'app-legacy'
 
