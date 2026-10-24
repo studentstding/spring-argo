@@ -56,7 +56,7 @@ spec:
               memory: 256Mi
       containers:
         - name: app-legacy
-          image: europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo:4-d8485a6
+          image: europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo:7-ce550e9
           env:
             - name: SPRING_PROFILES_ACTIVE
               value: "prod"
