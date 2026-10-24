@@ -17,14 +17,14 @@ spec:
         - cat
       tty: true
 
-    # Budowanie i wysyłanie obrazu
+    # Budowanie i wysyłanie obrazu do Artifact Registry
     - name: kaniko
       image: gcr.io/kaniko-project/executor:v1.23.2-debug
       command:
         - /busybox/cat
       tty: true
 
-    # Edycja manifestu YAML w repozytorium
+    # Edycja manifestu Kubernetes w repozytorium
     - name: yq
       image: mikefarah/yq:4.44.3
       command:
@@ -33,11 +33,13 @@ spec:
         - cat
       tty: true
 
-    # Commitowanie i wysyłanie zmian do repozytorium
+    # Commit oraz push zmienionego manifestu
     - name: git
-      image: alpine:3.20
+      image: alpine/git:2.47.2
       command:
-        - cat
+        - /bin/sh
+        - -c
+        - apk add --no-cache openssh-client && cat
       tty: true
 '''
         }
@@ -66,23 +68,25 @@ spec:
     environment {
         IMAGE_NAME = 'europe-central2-docker.pkg.dev/mr-dev12/docker-repo/spring-demo'
 
-        /*
-         * Jeśli app-deploy jest katalogiem, wpisz tutaj konkretny plik,
-         * na przykład:
-         *
-         * k8s/app-deploy/deployment.yaml
-         */
         MANIFEST_PATH = 'k8s/app-deploy.yaml'
-
         CONTAINER_NAME = 'app-legacy'
 
-        /*
-         * Gałąź, na którą Jenkins wypchnie zmianę manifestu.
-         */
         TARGET_BRANCH = 'main'
 
         /*
-         * Credential typu "SSH Username with private key".
+         * Adres SSH repozytorium.
+         *
+         * Checkout był wykonany przez HTTPS, ale push wykonujemy przez SSH,
+         * dlatego jawnie podajemy adres SSH.
+         */
+        GIT_SSH_URL = 'git@github.com:studentstding/spring-argo.git'
+
+        /*
+         * Jenkins credential:
+         *
+         * Kind: SSH Username with private key
+         * ID: github-ssh
+         * Username: git
          */
         GIT_SSH_CREDENTIALS_ID = 'github-ssh'
     }
@@ -91,27 +95,6 @@ spec:
 
         stage('Print Parameters') {
             steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: 'gcp-sa',
-                        usernameVariable: 'GCP_USER',
-                        passwordVariable: 'GCP_PASS'
-                    )
-                ]) {
-                    sh '''
-                        set +x
-
-                        echo "GCP user: ${GCP_USER}"
-
-                        if [ -n "${GCP_PASS}" ]; then
-                            echo "GCP password został poprawnie wczytany"
-                        else
-                            echo "Nie udało się wczytać GCP password"
-                            exit 1
-                        fi
-                    '''
-                }
-
                 echo "Message: ${params.Message}"
                 echo "Environment: ${params.ENVIRONMENT}"
                 echo "PARAM1: ${params.PARAM1}"
@@ -121,12 +104,40 @@ spec:
         stage('Build') {
             steps {
                 container('maven') {
-                    dir('spring-mvc-demo') {
-                        sh '''
-                            set -eu
-                            mvn clean package
-                        '''
-                    }
+                    sh '''
+                        set -eu
+
+                        echo "Katalog budowania:"
+                        pwd
+
+                        echo "Uruchamiam Maven"
+                        mvn clean package
+                    '''
+                }
+            }
+        }
+
+        stage('Verify JAR') {
+            steps {
+                container('maven') {
+                    sh '''
+                        set -eu
+
+                        echo "Pliki JAR utworzone przez Maven:"
+                        find . -type f -path "*/target/*.jar" -print
+
+                        JAR_COUNT="$(
+                            find . -type f \
+                                -path "*/target/*.jar" \
+                                ! -name "original-*" \
+                                | wc -l
+                        )"
+
+                        if [ "${JAR_COUNT}" -eq 0 ]; then
+                            echo "BŁĄD: Maven nie utworzył pliku JAR"
+                            exit 1
+                        fi
+                    '''
                 }
             }
         }
@@ -134,12 +145,13 @@ spec:
         stage('Build Image') {
             steps {
                 /*
-                 * Funkcja pochodzi z:
+                 * buildImage pochodzi z:
                  *
                  * @Library('company-library@main')
                  *
-                 * Zakładamy, że funkcja buduje obraz przez Kaniko
-                 * i wysyła go do Artifact Registry.
+                 * Funkcja korzysta z credentiala gcp-sa-key,
+                 * ustawia GOOGLE_APPLICATION_CREDENTIALS
+                 * i uruchamia Kaniko.
                  */
                 buildImage(
                     env.IMAGE_NAME,
@@ -154,8 +166,7 @@ spec:
                     sh '''
                         set -eu
 
-                        NEW_IMAGE="${IMAGE_NAME}:${BUILD_NUMBER}"
-                        export NEW_IMAGE
+                        export NEW_IMAGE="${IMAGE_NAME}:${BUILD_NUMBER}"
                         export CONTAINER_NAME
 
                         echo "Plik manifestu: ${MANIFEST_PATH}"
@@ -167,18 +178,32 @@ spec:
                             exit 1
                         fi
 
+                        /*
+                         * Manifest zawiera kilka dokumentów YAML.
+                         *
+                         * yq zwraca osobny wynik dla każdego dokumentu,
+                         * np. 0, 0, 1. awk sumuje te wyniki do jednej liczby.
+                         *
+                         * Operator []? pomija dokumenty, które nie mają
+                         * ścieżki spec.template.spec.containers.
+                         */
                         MATCHING_CONTAINERS="$(
                             yq '
                                 [
-                                    .spec.template.spec.containers[]
-                                    | select(.name == strenv(CONTAINER_NAME))
+                                    .spec.template.spec.containers[]?
+                                    | select(
+                                        .name == strenv(CONTAINER_NAME)
+                                    )
                                 ]
                                 | length
-                            ' "${MANIFEST_PATH}"
+                            ' "${MANIFEST_PATH}" \
+                            | awk '{ total += $1 } END { print total + 0 }'
                         )"
 
+                        echo "Liczba znalezionych kontenerów: ${MATCHING_CONTAINERS}"
+
                         if [ "${MATCHING_CONTAINERS}" -eq 0 ]; then
-                            echo "BŁĄD: W manifeście nie znaleziono kontenera ${CONTAINER_NAME}"
+                            echo "BŁĄD: Nie znaleziono kontenera ${CONTAINER_NAME}"
                             exit 1
                         fi
 
@@ -187,18 +212,26 @@ spec:
                             exit 1
                         fi
 
+                        /*
+                         * Zmiana jest wykonywana tylko w lokalnym pliku.
+                         * Nie ma tutaj żadnego połączenia z klastrem.
+                         */
                         yq -i '
                             (
-                                .spec.template.spec.containers[]
-                                | select(.name == strenv(CONTAINER_NAME))
+                                .spec.template.spec.containers[]?
+                                | select(
+                                    .name == strenv(CONTAINER_NAME)
+                                )
                                 | .image
                             ) = strenv(NEW_IMAGE)
                         ' "${MANIFEST_PATH}"
 
                         UPDATED_IMAGE="$(
                             yq -r '
-                                .spec.template.spec.containers[]
-                                | select(.name == strenv(CONTAINER_NAME))
+                                .spec.template.spec.containers[]?
+                                | select(
+                                    .name == strenv(CONTAINER_NAME)
+                                )
                                 | .image
                             ' "${MANIFEST_PATH}"
                         )"
@@ -220,11 +253,36 @@ spec:
         stage('Commit and Push Manifest') {
             steps {
                 container('git') {
-                    sshagent(credentials: [env.GIT_SSH_CREDENTIALS_ID]) {
+                    withCredentials([
+                        sshUserPrivateKey(
+                            credentialsId: env.GIT_SSH_CREDENTIALS_ID,
+                            keyFileVariable: 'GIT_SSH_KEY',
+                            usernameVariable: 'GIT_SSH_USERNAME'
+                        )
+                    ]) {
                         sh '''
                             set -eu
 
-                            apk add --no-cache git openssh-client
+                            mkdir -p "${HOME}/.ssh"
+                            chmod 700 "${HOME}/.ssh"
+
+                            /*
+                             * Dodajemy klucz hosta GitHub, żeby SSH nie czekało
+                             * na interaktywne potwierdzenie.
+                             */
+                            ssh-keyscan -H github.com \
+                                > "${HOME}/.ssh/known_hosts"
+
+                            chmod 600 "${HOME}/.ssh/known_hosts"
+                            chmod 600 "${GIT_SSH_KEY}"
+
+                            /*
+                             * Git użyje klucza przekazanego przez Jenkins.
+                             */
+                            export GIT_SSH_COMMAND="ssh \
+                                -i ${GIT_SSH_KEY} \
+                                -o IdentitiesOnly=yes \
+                                -o UserKnownHostsFile=${HOME}/.ssh/known_hosts"
 
                             git config user.name "Jenkins"
                             git config user.email "jenkins@localhost"
@@ -243,10 +301,18 @@ spec:
                             git commit \
                                 -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${BUILD_NUMBER} [skip ci]"
 
-                            git push origin "HEAD:${TARGET_BRANCH}"
+                            /*
+                             * Nie zmieniamy origin, ponieważ checkout został
+                             * wykonany przez HTTPS.
+                             *
+                             * Push wykonujemy bezpośrednio na adres SSH.
+                             */
+                            git push \
+                                "${GIT_SSH_URL}" \
+                                "HEAD:${TARGET_BRANCH}"
 
-                            echo "Zmiana została wypchnięta do repozytorium"
-                            echo "Argo CD może teraz zsynchronizować manifest z klastrem"
+                            echo "Manifest został wysłany do repozytorium"
+                            echo "Dalszą synchronizację wykonuje Argo CD"
                         '''
                     }
                 }
@@ -258,7 +324,7 @@ spec:
         success {
             echo 'Pipeline zakończył się poprawnie.'
             echo "Zbudowany obraz: ${env.IMAGE_NAME}:${env.BUILD_NUMBER}"
-            echo 'Manifest został zaktualizowany w repozytorium.'
+            echo "Zmieniony manifest: ${env.MANIFEST_PATH}"
         }
 
         failure {
