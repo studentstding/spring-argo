@@ -40,6 +40,11 @@ spec:
         }
     }
 
+    options {
+        // Dwa buildy naraz kłóciłyby się przy pushu manifestu
+        disableConcurrentBuilds()
+    }
+
     parameters {
         text(
             name: 'Message',
@@ -78,197 +83,230 @@ spec:
 
         GIT_SSH_URL = 'git@github.com:studentstding/spring-argo.git'
         GIT_SSH_CREDENTIALS_ID = 'github-ssh'
+
+        // Tożsamość, z jaką Jenkins robi commity - po niej rozpoznajemy własne commity
+        GIT_BOT_NAME  = 'Jenkins'
+        GIT_BOT_EMAIL = 'jenkins@localhost'
     }
 
     stages {
 
-        stage('Print Parameters') {
+        stage('Check Trigger') {
+            // Bezpiecznik przed pętlą: jeśli build wywołał commit Jenkinsa, nic nie robimy
             steps {
-                echo "Message: ${params.Message}"
-                echo "Environment: ${params.ENVIRONMENT}"
-                echo "PARAM1: ${params.PARAM1}"
-            }
-        }
+                script {
+                    def author  = sh(script: 'git log -1 --pretty=format:%ae', returnStdout: true).trim()
+                    def message = sh(script: 'git log -1 --pretty=format:%B', returnStdout: true).trim()
 
-        stage('Test') {
-            // Dockerfile buduje WAR z -DskipTests, więc testy uruchamiamy tutaj
-            steps {
-                container('maven') {
-                    dir("${env.APP_DIR}") {
-                        sh '''
-                            set -eu
-                            mvn -B test
-                        '''
+                    if (author == env.GIT_BOT_EMAIL || message.contains('[skip ci]')) {
+                        env.SKIP_CI = 'true'
+                        currentBuild.result = 'NOT_BUILT'
+                        currentBuild.description = 'Pominięto: commit od Jenkinsa'
+                        echo "Ostatni commit (${author}) pochodzi od Jenkinsa - pomijam build"
+                    } else {
+                        env.SKIP_CI = 'false'
                     }
                 }
             }
         }
 
-        stage('Build & Push Image') {
-            steps {
-                container('kaniko') {
-                    withCredentials([
-                        file(
-                            credentialsId: env.GCP_SA_KEY_CREDENTIALS_ID,
-                            variable: 'GCP_SA_KEY'
-                        )
-                    ]) {
-                        sh '''
-                            set +x
-                            set -eu
+        stage('CI/CD') {
+            when {
+                expression { env.SKIP_CI != 'true' }
+            }
 
-                            # Host rejestru, np. europe-central2-docker.pkg.dev
-                            REGISTRY="${IMAGE_NAME%%/*}"
+            stages {
 
-                            # Logowanie do Artifact Registry kluczem JSON (_json_key)
-                            mkdir -p /kaniko/.docker
-                            AUTH="$(printf '%s' "_json_key:$(cat "${GCP_SA_KEY}")" | base64 | tr -d '\\n')"
-                            printf '{"auths":{"%s":{"auth":"%s"}}}' "${REGISTRY}" "${AUTH}" \\
-                                > /kaniko/.docker/config.json
-
-                            echo "Budowanie i push obrazu: ${IMAGE_NAME}:${IMAGE_TAG}"
-
-                            /kaniko/executor \\
-                                --context="dir://${WORKSPACE}/${APP_DIR}" \\
-                                --dockerfile="${WORKSPACE}/${APP_DIR}/Dockerfile" \\
-                                --destination="${IMAGE_NAME}:${IMAGE_TAG}" \\
-                                --cache=true \\
-                                --cache-repo="${IMAGE_NAME}/cache"
-
-                            rm -f /kaniko/.docker/config.json
-                            echo "Obraz wypchnięty: ${IMAGE_NAME}:${IMAGE_TAG}"
-                        '''
+                stage('Print Parameters') {
+                    steps {
+                        echo "Message: ${params.Message}"
+                        echo "Environment: ${params.ENVIRONMENT}"
+                        echo "PARAM1: ${params.PARAM1}"
                     }
                 }
-            }
-        }
 
-        stage('Update Image in Manifest') {
-            steps {
-                container('yq') {
-                    sh '''
-                        set -eu
-
-                        export NEW_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
-                        export CONTAINER_NAME
-
-                        echo "Plik manifestu: ${MANIFEST_PATH}"
-                        echo "Nazwa kontenera: ${CONTAINER_NAME}"
-                        echo "Nowy obraz: ${NEW_IMAGE}"
-
-                        if [ ! -f "${MANIFEST_PATH}" ]; then
-                            echo "BŁĄD: Nie znaleziono pliku ${MANIFEST_PATH}"
-                            exit 1
-                        fi
-
-                        # Tylko dokumenty kind: Deployment - plik zawiera też Namespace, ServiceAccount itd.
-                        MATCHING_CONTAINERS="$(
-                            yq '
-                                select(.kind == "Deployment")
-                                | [
-                                    .spec.template.spec.containers[]
-                                    | select(.name == strenv(CONTAINER_NAME))
-                                ]
-                                | length
-                            ' "${MANIFEST_PATH}" \
-                            | awk '{ total += $1 } END { print total + 0 }'
-                        )"
-
-                        echo "Liczba znalezionych kontenerów: ${MATCHING_CONTAINERS}"
-
-                        if [ "${MATCHING_CONTAINERS}" -eq 0 ]; then
-                            echo "BŁĄD: Nie znaleziono kontenera ${CONTAINER_NAME}"
-                            exit 1
-                        fi
-
-                        if [ "${MATCHING_CONTAINERS}" -gt 1 ]; then
-                            echo "BŁĄD: Znaleziono więcej niż jeden kontener ${CONTAINER_NAME}"
-                            exit 1
-                        fi
-
-                        # "with" zmienia tylko istniejące węzły - nie tworzy ścieżek w innych dokumentach
-                        yq -i '
-                            with(
-                                select(.kind == "Deployment")
-                                | .spec.template.spec.containers[]
-                                | select(.name == strenv(CONTAINER_NAME));
-                                .image = strenv(NEW_IMAGE)
-                            )
-                        ' "${MANIFEST_PATH}"
-
-                        UPDATED_IMAGE="$(
-                            yq -r '
-                                select(.kind == "Deployment")
-                                | .spec.template.spec.containers[]
-                                | select(.name == strenv(CONTAINER_NAME))
-                                | .image
-                            ' "${MANIFEST_PATH}"
-                        )"
-                        echo "Obraz odczytany po zmianie: ${UPDATED_IMAGE}"
-
-                        if [ "${UPDATED_IMAGE}" != "${NEW_IMAGE}" ]; then
-                            echo "BŁĄD: Weryfikacja zmiany obrazu nie powiodła się"
-                            echo "Oczekiwano: ${NEW_IMAGE}"
-                            echo "Odczytano: ${UPDATED_IMAGE}"
-                            exit 1
-                        fi
-
-                        echo "Manifest został poprawnie zmieniony"
-                    '''
+                stage('Test') {
+                    // Dockerfile buduje WAR z -DskipTests, więc testy uruchamiamy tutaj
+                    steps {
+                        container('maven') {
+                            dir("${env.APP_DIR}") {
+                                sh '''
+                                    set -eu
+                                    mvn -B test
+                                '''
+                            }
+                        }
+                    }
                 }
-            }
-        }
 
-        stage('Commit and Push Manifest') {
-            steps {
-                container('git') {
-                    withCredentials([
-                        sshUserPrivateKey(
-                            credentialsId: env.GIT_SSH_CREDENTIALS_ID,
-                            keyFileVariable: 'GIT_SSH_KEY',
-                            usernameVariable: 'GIT_SSH_USERNAME'
-                        )
-                    ]) {
-                        sh '''
-                            set +x
-                            set -eu
+                stage('Build & Push Image') {
+                    steps {
+                        container('kaniko') {
+                            withCredentials([
+                                file(
+                                    credentialsId: env.GCP_SA_KEY_CREDENTIALS_ID,
+                                    variable: 'GCP_SA_KEY'
+                                )
+                            ]) {
+                                sh '''
+                                    set +x
+                                    set -eu
 
-                            # Kontener git działa jako root, a workspace należy do użytkownika jenkins
-                            git config --global --add safe.directory "${WORKSPACE}"
+                                    # Host rejestru, np. europe-central2-docker.pkg.dev
+                                    REGISTRY="${IMAGE_NAME%%/*}"
 
-                            mkdir -p "${HOME}/.ssh"
-                            chmod 700 "${HOME}/.ssh"
+                                    # Logowanie do Artifact Registry kluczem JSON (_json_key)
+                                    mkdir -p /kaniko/.docker
+                                    AUTH="$(printf '%s' "_json_key:$(cat "${GCP_SA_KEY}")" | base64 | tr -d '\\n')"
+                                    printf '{"auths":{"%s":{"auth":"%s"}}}' "${REGISTRY}" "${AUTH}" \\
+                                        > /kaniko/.docker/config.json
 
-                            ssh-keyscan -H github.com > "${HOME}/.ssh/known_hosts"
-                            chmod 600 "${HOME}/.ssh/known_hosts"
-                            chmod 600 "${GIT_SSH_KEY}"
+                                    echo "Budowanie i push obrazu: ${IMAGE_NAME}:${IMAGE_TAG}"
 
-                            export GIT_SSH_COMMAND="ssh -i ${GIT_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${HOME}/.ssh/known_hosts"
+                                    /kaniko/executor \\
+                                        --context="dir://${WORKSPACE}/${APP_DIR}" \\
+                                        --dockerfile="${WORKSPACE}/${APP_DIR}/Dockerfile" \\
+                                        --destination="${IMAGE_NAME}:${IMAGE_TAG}" \\
+                                        --cache=true \\
+                                        --cache-repo="${IMAGE_NAME}/cache"
 
-                            git config user.name "Jenkins"
-                            git config user.email "jenkins@localhost"
+                                    rm -f /kaniko/.docker/config.json
+                                    echo "Obraz wypchnięty: ${IMAGE_NAME}:${IMAGE_TAG}"
+                                '''
+                            }
+                        }
+                    }
+                }
 
-                            echo "Zmiany w manifeście:"
-                            git --no-pager diff -- "${MANIFEST_PATH}"
+                stage('Update Image in Manifest') {
+                    steps {
+                        container('yq') {
+                            sh '''
+                                set -eu
 
-                            if git diff --quiet -- "${MANIFEST_PATH}"; then
-                                echo "Brak zmian w manifeście"
-                                echo "Commit i push zostają pominięte"
-                                exit 0
-                            fi
+                                export NEW_IMAGE="${IMAGE_NAME}:${IMAGE_TAG}"
+                                export CONTAINER_NAME
 
-                            git add "${MANIFEST_PATH}"
+                                echo "Plik manifestu: ${MANIFEST_PATH}"
+                                echo "Nazwa kontenera: ${CONTAINER_NAME}"
+                                echo "Nowy obraz: ${NEW_IMAGE}"
 
-                            git commit -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${IMAGE_TAG} [skip ci]"
+                                if [ ! -f "${MANIFEST_PATH}" ]; then
+                                    echo "BŁĄD: Nie znaleziono pliku ${MANIFEST_PATH}"
+                                    exit 1
+                                fi
 
-                            # Na wypadek, gdyby ktoś w międzyczasie wypchnął coś na gałąź docelową
-                            git pull --rebase "${GIT_SSH_URL}" "${TARGET_BRANCH}"
+                                # Tylko dokumenty kind: Deployment - plik zawiera też Namespace, ServiceAccount itd.
+                                MATCHING_CONTAINERS="$(
+                                    yq '
+                                        select(.kind == "Deployment")
+                                        | [
+                                            .spec.template.spec.containers[]
+                                            | select(.name == strenv(CONTAINER_NAME))
+                                        ]
+                                        | length
+                                    ' "${MANIFEST_PATH}" \
+                                    | awk '{ total += $1 } END { print total + 0 }'
+                                )"
 
-                            git push "${GIT_SSH_URL}" "HEAD:${TARGET_BRANCH}"
+                                echo "Liczba znalezionych kontenerów: ${MATCHING_CONTAINERS}"
 
-                            echo "Manifest został wysłany do repozytorium"
-                            echo "Synchronizację z klastrem wykona Argo CD"
-                        '''
+                                if [ "${MATCHING_CONTAINERS}" -eq 0 ]; then
+                                    echo "BŁĄD: Nie znaleziono kontenera ${CONTAINER_NAME}"
+                                    exit 1
+                                fi
+
+                                if [ "${MATCHING_CONTAINERS}" -gt 1 ]; then
+                                    echo "BŁĄD: Znaleziono więcej niż jeden kontener ${CONTAINER_NAME}"
+                                    exit 1
+                                fi
+
+                                # "with" zmienia tylko istniejące węzły - nie tworzy ścieżek w innych dokumentach
+                                yq -i '
+                                    with(
+                                        select(.kind == "Deployment")
+                                        | .spec.template.spec.containers[]
+                                        | select(.name == strenv(CONTAINER_NAME));
+                                        .image = strenv(NEW_IMAGE)
+                                    )
+                                ' "${MANIFEST_PATH}"
+
+                                UPDATED_IMAGE="$(
+                                    yq -r '
+                                        select(.kind == "Deployment")
+                                        | .spec.template.spec.containers[]
+                                        | select(.name == strenv(CONTAINER_NAME))
+                                        | .image
+                                    ' "${MANIFEST_PATH}"
+                                )"
+
+                                echo "Obraz odczytany po zmianie: ${UPDATED_IMAGE}"
+
+                                if [ "${UPDATED_IMAGE}" != "${NEW_IMAGE}" ]; then
+                                    echo "BŁĄD: Weryfikacja zmiany obrazu nie powiodła się"
+                                    echo "Oczekiwano: ${NEW_IMAGE}"
+                                    echo "Odczytano: ${UPDATED_IMAGE}"
+                                    exit 1
+                                fi
+
+                                echo "Manifest został poprawnie zmieniony"
+                            '''
+                        }
+                    }
+                }
+
+                stage('Commit and Push Manifest') {
+                    steps {
+                        container('git') {
+                            withCredentials([
+                                sshUserPrivateKey(
+                                    credentialsId: env.GIT_SSH_CREDENTIALS_ID,
+                                    keyFileVariable: 'GIT_SSH_KEY',
+                                    usernameVariable: 'GIT_SSH_USERNAME'
+                                )
+                            ]) {
+                                sh '''
+                                    set +x
+                                    set -eu
+
+                                    # Kontener git działa jako root, a workspace należy do użytkownika jenkins
+                                    git config --global --add safe.directory "${WORKSPACE}"
+
+                                    mkdir -p "${HOME}/.ssh"
+                                    chmod 700 "${HOME}/.ssh"
+
+                                    ssh-keyscan -H github.com > "${HOME}/.ssh/known_hosts"
+                                    chmod 600 "${HOME}/.ssh/known_hosts"
+                                    chmod 600 "${GIT_SSH_KEY}"
+
+                                    export GIT_SSH_COMMAND="ssh -i ${GIT_SSH_KEY} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${HOME}/.ssh/known_hosts"
+
+                                    git config user.name  "${GIT_BOT_NAME}"
+                                    git config user.email "${GIT_BOT_EMAIL}"
+
+                                    echo "Zmiany w manifeście:"
+                                    git --no-pager diff -- "${MANIFEST_PATH}"
+
+                                    if git diff --quiet -- "${MANIFEST_PATH}"; then
+                                        echo "Brak zmian w manifeście"
+                                        echo "Commit i push zostają pominięte"
+                                        exit 0
+                                    fi
+
+                                    git add "${MANIFEST_PATH}"
+
+                                    git commit -m "Update ${CONTAINER_NAME} image to ${IMAGE_NAME}:${IMAGE_TAG} [skip ci]"
+
+                                    # Na wypadek, gdyby ktoś w międzyczasie wypchnął coś na gałąź docelową
+                                    git pull --rebase "${GIT_SSH_URL}" "${TARGET_BRANCH}"
+
+                                    git push "${GIT_SSH_URL}" "HEAD:${TARGET_BRANCH}"
+
+                                    echo "Manifest został wysłany do repozytorium"
+                                    echo "Synchronizację z klastrem wykona Argo CD"
+                                '''
+                            }
+                        }
                     }
                 }
             }
@@ -280,6 +318,10 @@ spec:
             echo 'Pipeline zakończył się poprawnie.'
             echo "Zbudowany obraz: ${env.IMAGE_NAME}:${env.IMAGE_TAG}"
             echo "Zmieniony manifest: ${env.MANIFEST_PATH}"
+        }
+
+        notBuilt {
+            echo 'Build pominięty - commit pochodził od Jenkinsa.'
         }
 
         failure {
